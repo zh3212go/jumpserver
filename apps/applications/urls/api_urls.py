@@ -1,24 +1,20 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+# coding:utf-8
 #
-
-from django.conf.urls import url
-from rest_framework import routers
-
+from django.urls import path
+from rest_framework_bulk.routes import BulkRouter
 from .. import api
+
 
 app_name = 'applications'
 
-router = routers.DefaultRouter()
-router.register(r'v1/terminal/heatbeat', api.TerminalHeatbeatViewSet, 'terminal-heatbeat')
-router.register(r'v1/terminal', api.TerminalViewSet, 'terminal')
+
+router = BulkRouter()
+router.register(r'applications', api.ApplicationViewSet, 'application')
+
 
 urlpatterns = [
-    url(r'^v1/terminal/register/$', api.TerminalRegisterView.as_view(),
-        name='terminal-register'),
-    url(r'^v1/terminate/connection/$', api.TerminateConnectionView.as_view(),
-        name='terminate-connection')
-    # url(r'^v1/terminal/heatbeat/$', api.TestHeatbeat.as_view())
+    path('remote-apps/<uuid:pk>/connection-info/', api.RemoteAppConnectionInfoApi.as_view(), name='remote-app-connection-info'),
 ]
+
 
 urlpatterns += router.urls
