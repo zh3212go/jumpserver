@@ -1,0 +1,21 @@
+{% load i18n %}
+<p>
+    {% trans 'Dear' %} {{ name }},
+</p>
+
+<p>
+    {% blocktranslate %}The following {{ item_type }} will expire in {{ count }}{% endblocktranslate %}
+</p>
+
+<ul>
+    {% for item in items %}
+        <li>{{ item }}</li>
+    {% endfor %}
+</ul>
+
+{% include 'perms/_asset_permission_renewal_links.html' %}
+
+<br>
+<p>
+    {% trans 'If you have any question, please contact the administrator' %}
+</p>

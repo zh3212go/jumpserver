@@ -1,304 +1,253 @@
-# ~*~ coding: utf-8 ~*~
-from __future__ import unicode_literals
-
 import os
-from collections import namedtuple, defaultdict
+import shlex
+import shutil
+import uuid
 
-from ansible.executor.task_queue_manager import TaskQueueManager
-from ansible.vars import VariableManager
-from ansible.parsing.dataloader import DataLoader
-from ansible.executor.playbook_executor import PlaybookExecutor
-from ansible.playbook.play import Play
-import ansible.constants as C
-from ansible.utils.vars import load_extra_vars
-from ansible.utils.vars import load_options_vars
+from django.conf import settings
+from django.utils._os import safe_join
 
-from .inventory import JMSInventory
-from .callback import AdHocResultCallback, PlaybookResultCallBack, \
-    CommandResultCallback
-from common.utils import get_logger
+from common.utils import is_macos
+from common.utils.yml import sanitize_ansible_inventory_json, sanitize_ansible_playbook
 
+from ..utils import get_ansible_log_verbosity
+from .callback import DefaultCallback
+from .docker import (
+    docker_extravars,
+    prepare_isolated_ansible_runtime,
+    stage_inventory_for_docker,
+)
+from .exception import CommandInBlackListException
+from .interface import interface
+from .execution import use_ansible_ssh_executor
+from .utils import escape_jinja2_syntax, neutralize_jinja2_syntax
 
-__all__ = ["AdHocRunner", "PlayBookRunner"]
-
-C.HOST_KEY_CHECKING = False
-
-logger = get_logger(__name__)
-
-
-# Jumpserver not use playbook
-class PlayBookRunner(object):
-    """
-    用于执行AnsiblePlaybook的接口.简化Playbook对象的使用.
-    """
-    Options = namedtuple('Options', [
-        'listtags', 'listtasks', 'listhosts', 'syntax', 'connection',
-        'module_path', 'forks', 'remote_user', 'private_key_file', 'timeout',
-        'ssh_common_args', 'ssh_extra_args', 'sftp_extra_args',
-        'scp_extra_args', 'become', 'become_method', 'become_user',
-        'verbosity', 'check', 'extra_vars'])
-
-    def __init__(self,
-                 hosts=None,
-                 playbook_path=None,
-                 forks=C.DEFAULT_FORKS,
-                 listtags=False,
-                 listtasks=False,
-                 listhosts=False,
-                 syntax=False,
-                 module_path=None,
-                 remote_user='root',
-                 timeout=C.DEFAULT_TIMEOUT,
-                 ssh_common_args=None,
-                 ssh_extra_args=None,
-                 sftp_extra_args=None,
-                 scp_extra_args=None,
-                 become=True,
-                 become_method=None,
-                 become_user="root",
-                 verbosity=None,
-                 extra_vars=None,
-                 connection_type="ssh",
-                 passwords=None,
-                 private_key_file=None,
-                 check=False):
-
-        C.RETRY_FILES_ENABLED = False
-        self.callbackmodule = PlaybookResultCallBack()
-        if playbook_path is None or not os.path.exists(playbook_path):
-            raise AnsibleError(
-                "Not Found the playbook file: %s." % playbook_path)
-        self.playbook_path = playbook_path
-        self.loader = DataLoader()
-        self.variable_manager = VariableManager()
-        self.passwords = passwords or {}
-        self.inventory = JMSInventory(hosts)
-
-        self.options = self.Options(
-            listtags=listtags,
-            listtasks=listtasks,
-            listhosts=listhosts,
-            syntax=syntax,
-            timeout=timeout,
-            connection=connection_type,
-            module_path=module_path,
-            forks=forks,
-            remote_user=remote_user,
-            private_key_file=private_key_file,
-            ssh_common_args=ssh_common_args or "",
-            ssh_extra_args=ssh_extra_args or "",
-            sftp_extra_args=sftp_extra_args,
-            scp_extra_args=scp_extra_args,
-            become=become,
-            become_method=become_method,
-            become_user=become_user,
-            verbosity=verbosity,
-            extra_vars=extra_vars or [],
-            check=check
-        )
-
-        self.variable_manager.extra_vars = load_extra_vars(loader=self.loader,
-                                                           options=self.options)
-        self.variable_manager.options_vars = load_options_vars(self.options)
-
-        self.variable_manager.set_inventory(self.inventory)
-
-        # 初始化playbook的executor
-        self.runner = PlaybookExecutor(
-            playbooks=[self.playbook_path],
-            inventory=self.inventory,
-            variable_manager=self.variable_manager,
-            loader=self.loader,
-            options=self.options,
-            passwords=self.passwords)
-
-        if self.runner._tqm:
-            self.runner._tqm._stdout_callback = self.callbackmodule
-
-    def run(self):
-        if not self.inventory.list_hosts('all'):
-            raise AnsibleError('Inventory is empty')
-        self.runner.run()
-        self.runner._tqm.cleanup()
-        return self.callbackmodule.output
+__all__ = [
+    'AdHocRunner', 'PlaybookRunner', 'SuperPlaybookRunner', 'UploadFileRunner',
+    'escape_jinja2_syntax', 'neutralize_jinja2_syntax', 'quote_ansible_module_arg',
+]
 
 
-class AdHocRunner(object):
-    """
-    ADHoc接口
-    """
-    Options = namedtuple("Options", [
-        'connection', 'module_path', 'private_key_file', "remote_user",
-        'timeout', 'forks', 'become', 'become_method', 'become_user',
-        'check', 'extra_vars',
-        ]
-    )
+def quote_ansible_module_arg(value):
+    """Keep user text inside one double-quoted Ansible module arg."""
+    if not isinstance(value, str):
+        return value
+    return value.replace('\\', '\\\\').replace('"', '\\"')
 
-    results_callback_class = AdHocResultCallback
 
-    def __init__(self,
-                 hosts=C.DEFAULT_HOST_LIST,
-                 forks=C.DEFAULT_FORKS,  # 5
-                 timeout=C.DEFAULT_TIMEOUT,  # SSH timeout = 10s
-                 remote_user=C.DEFAULT_REMOTE_USER,  # root
-                 module_path=None,  # dirs of custome modules
-                 connection_type="smart",
-                 become=None,
-                 become_method=None,
-                 become_user=None,
-                 check=False,
-                 passwords=None,
-                 extra_vars=None,
-                 private_key_file=None,
-                 gather_facts='no'):
+class AdHocRunner:
+    cmd_modules_choices = ('shell', 'raw', 'command', 'script', 'win_shell')
+    need_local_connection_modules_choices = ("mysql", "postgresql", "sqlserver", "huawei")
 
-        self.pattern = ''
-        self.variable_manager = VariableManager()
-        self.loader = DataLoader()
-        self.gather_facts = gather_facts
-        self.results_callback = AdHocRunner.results_callback_class()
-        self.options = self.Options(
-            connection=connection_type,
-            timeout=timeout,
-            module_path=module_path,
-            forks=forks,
-            become=become,
-            become_method=become_method,
-            become_user=become_user,
-            check=check,
-            remote_user=remote_user,
-            extra_vars=extra_vars or [],
-            private_key_file=private_key_file,
-        )
-
-        self.variable_manager.extra_vars = load_extra_vars(self.loader,
-                                                           options=self.options)
-        self.variable_manager.options_vars = load_options_vars(self.options)
-        self.passwords = passwords or {}
-        self.inventory = JMSInventory(hosts)
-        self.variable_manager.set_inventory(self.inventory)
-        self.tasks = []
-        self.play_source = None
-        self.play = None
+    def __init__(self, inventory, job_module, module, module_args='', pattern='*', project_dir='/tmp/', extra_vars=None,
+                 dry_run=False, timeout=-1):
+        if extra_vars is None:
+            extra_vars = {}
+        self.id = uuid.uuid4()
+        self.inventory = inventory
+        self.pattern = pattern
+        self.module = module
+        self.job_module = job_module
+        self.module_args = module_args
+        self.project_dir = project_dir
+        self.cb = DefaultCallback()
         self.runner = None
+        self.extra_vars = extra_vars
+        self.dry_run = dry_run
+        self.timeout = timeout
+        self.envs = {}
 
-    @staticmethod
-    def check_module_args(module_name, module_args=''):
-        if module_name in C.MODULE_REQUIRE_ARGS and not module_args:
-            err = "No argument passed to '%s' module." % module_name
-            print(err)
-            return False
-        return True
+    def check_module(self):
+        if self.module not in self.cmd_modules_choices:
+            return
+        command = self.module_args
+        if command and set(command.split()).intersection(set(settings.SECURITY_COMMAND_BLACKLIST)):
+            raise CommandInBlackListException(
+                "Command is rejected by black list: {}".format(self.module_args))
 
-    def run(self, task_tuple, pattern='all', task_name='Ansible Ad-hoc'):
-        """
-        :param task_tuple:  (('shell', 'ls'), ('ping', ''))
-        :param pattern:
-        :param task_name:
-        :return:
-        """
-        for module, args in task_tuple:
-            if not self.check_module_args(module, args):
-                return
-            self.tasks.append(
-                dict(action=dict(
-                    module=module,
-                    args=args,
-                ))
-            )
+    def set_local_connection(self):
+        if self.job_module in self.need_local_connection_modules_choices:
+            self.envs.update({"ANSIBLE_SUPER_MODE": "1"})
 
-        self.play_source = dict(
-            name=task_name,
-            hosts=pattern,
-            gather_facts=self.gather_facts,
-            tasks=self.tasks
-        )
+    def run(self, verbosity=0, **kwargs):
+        self.check_module()
+        self.set_local_connection()
+        verbosity = get_ansible_log_verbosity(verbosity)
 
-        self.play = Play().load(
-            self.play_source,
-            variable_manager=self.variable_manager,
-            loader=self.loader,
-        )
+        if not os.path.exists(self.project_dir):
+            os.makedirs(self.project_dir, 0o755, exist_ok=True)
+        private_env = safe_join(self.project_dir, 'env')
+        if os.path.exists(private_env):
+            shutil.rmtree(private_env)
 
-        self.runner = TaskQueueManager(
-            inventory=self.inventory,
-            variable_manager=self.variable_manager,
-            loader=self.loader,
-            options=self.options,
-            passwords=self.passwords,
-            stdout_callback=self.results_callback,
-        )
+        self.envs.update(prepare_isolated_ansible_runtime(self.project_dir))
 
-        if not self.inventory.list_hosts("all"):
-            raise AnsibleError("Inventory is empty.")
+        run_kwargs = {
+            'timeout': self.timeout if self.timeout > 0 else None,
+            'extravars': docker_extravars(self.extra_vars),
+            'envvars': self.envs,
+            'host_pattern': self.pattern,
+            'private_data_dir': self.project_dir,
+            'inventory': stage_inventory_for_docker(self.project_dir, self.inventory),
+            'module': self.module,
+            'module_args': self.module_args,
+            'verbosity': verbosity,
+            'event_handler': self.cb.event_handler,
+            'status_handler': self.cb.status_handler,
+            **kwargs,
+        }
+        interface.run(**run_kwargs)
+        return self.cb
 
-        if not self.inventory.list_hosts(self.pattern):
-            raise AnsibleError(
-                "pattern: %s  dose not match any hosts." % self.pattern)
+
+class PlaybookRunner:
+    def __init__(
+            self, inventory, playbook, project_dir='/tmp/', callback=None, extra_vars=None,
+            safety_mode=None, inventory_safety=None,
+    ):
+
+        self.id = uuid.uuid4()
+        self.inventory = inventory
+        self.playbook = playbook
+        self.project_dir = project_dir
+        if not callback:
+            callback = DefaultCallback()
+        self.cb = callback
+        self.isolate = True
+        self.envs = {}
+        if extra_vars is None:
+            extra_vars = {}
+        self.extra_vars = extra_vars
+        self.safety_mode = safety_mode
+        self.inventory_safety = inventory_safety
+
+    def copy_playbook(self):
+        entry = os.path.basename(self.playbook)
+        playbook_dir = os.path.dirname(self.playbook)
+        project_playbook_dir = os.path.join(self.project_dir, "project")
+        if os.path.realpath(playbook_dir) != os.path.realpath(project_playbook_dir):
+            shutil.copytree(playbook_dir, project_playbook_dir, dirs_exist_ok=True)
+        self.playbook = entry
+
+    def prepare_safe_inputs(self):
+        # Security anchor:
+        # For system-generated Ansible inputs that may contain user-controlled values,
+        # callers should explicitly enable safety_mode / inventory_safety so the runner
+        # sanitizes the task-private playbook / inventory before Ansible runs.
+        # This is intended for system-generated inputs whose values should be treated as
+        # literal data, not for arbitrary user-authored playbooks or execution logic.
+        if self.safety_mode == "playbook_unsafe":
+            project_playbook = os.path.join(self.project_dir, "project", self.playbook)
+            sanitize_ansible_playbook(project_playbook, project_playbook)
+            os.chmod(project_playbook, 0o600)
+
+        if self.inventory_safety == "json_escape":
+            sanitize_ansible_inventory_json(self.inventory, self.inventory)
+            os.chmod(self.inventory, 0o600)
+    @property
+    def playbook_project_dir(self):
+        return os.path.join(self.project_dir, 'project')
+
+    def run(self, verbosity=0, **kwargs):
+        if not os.path.exists(self.project_dir):
+            os.makedirs(self.project_dir, mode=0o755)
+        self.copy_playbook()
+        self.prepare_safe_inputs()
+
+        verbosity = get_ansible_log_verbosity(verbosity)
+        private_env = safe_join(self.project_dir, 'env')
+        if os.path.exists(private_env):
+            shutil.rmtree(private_env)
+
+        self.envs.update(prepare_isolated_ansible_runtime(self.project_dir))
+        inventory = stage_inventory_for_docker(self.project_dir, self.inventory)
+
+        kwargs = dict(kwargs)
+        if self.isolate and not is_macos() and not use_ansible_ssh_executor():
+            kwargs['process_isolation'] = True
+            kwargs['process_isolation_executable'] = 'bwrap'
 
         try:
-            self.runner.run(self.play)
-        except Exception as e:
-            logger.warning(e)
-        else:
-            logger.debug(self.results_callback.result_q)
-            return self.results_callback.result_q
+            interface.run(
+                private_data_dir=self.project_dir,
+                inventory=inventory,
+                playbook=self.playbook,
+                verbosity=verbosity,
+                event_handler=self.cb.event_handler,
+                status_handler=self.cb.status_handler,
+                host_cwd=self.playbook_project_dir,
+                envvars=self.envs,
+                extravars=docker_extravars(self.extra_vars),
+                **kwargs
+            )
         finally:
-            if self.runner:
-                self.runner.cleanup()
-            if self.loader:
-                self.loader.cleanup_all_tmp_files()
+            close_callback = getattr(self.cb, 'close', None)
+            if close_callback:
+                close_callback()
+        return self.cb
 
-    def clean_result(self):
-        """
-        :return: {
-            "success": ['hostname',],
-            "failed": [('hostname', 'msg'), {}],
+
+class SuperPlaybookRunner(PlaybookRunner):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.envs = {"ANSIBLE_SUPER_MODE": "1"}
+        self.isolate = False
+
+    def run(self, *args, **kwargs):
+        # Automation tasks report their own user-oriented progress. Suppress
+        # Ansible's raw PLAY/TASK/RECAP stream unless an administrator has
+        # explicitly enabled Ansible debugging.
+        kwargs.setdefault('quiet', not settings.DEBUG_ANSIBLE)
+        return super().run(*args, **kwargs)
+
+
+class UploadFileRunner:
+    UPLOAD_STAGING_DIR = 'upload'
+
+    def __init__(self, inventory, project_dir, job_id, dest_path, callback=None):
+        self.id = uuid.uuid4()
+        self.inventory = inventory
+        self.project_dir = project_dir
+        self.cb = DefaultCallback()
+        self.envs = {}
+        upload_file_dir = safe_join(settings.SHARE_DIR, 'job_upload_file')
+        self.share_src_dir = safe_join(upload_file_dir, str(job_id))
+        self.dest_path = safe_join("/tmp", neutralize_jinja2_syntax(dest_path or ''))
+
+    def stage_upload_files(self):
+        """Keep upload sources inside the task directory sent to the executor."""
+        if not os.path.isdir(self.share_src_dir):
+            raise FileNotFoundError(f'Upload source directory not found: {self.share_src_dir}')
+        staged_dir = os.path.join(self.project_dir, self.UPLOAD_STAGING_DIR)
+        if os.path.exists(staged_dir):
+            shutil.rmtree(staged_dir)
+        shutil.copytree(self.share_src_dir, staged_dir)
+        return staged_dir
+
+    def run(self, verbosity=0, **kwargs):
+        if not os.path.exists(self.project_dir):
+            os.makedirs(self.project_dir, mode=0o755, exist_ok=True)
+
+        self.envs.update(prepare_isolated_ansible_runtime(self.project_dir))
+        src_path = self.stage_upload_files()
+
+        verbosity = get_ansible_log_verbosity(verbosity)
+        run_kwargs = {
+            'private_data_dir': self.project_dir,
+            'host_pattern': "*",
+            'inventory': stage_inventory_for_docker(self.project_dir, self.inventory),
+            'module': 'copy',
+            'module_args': 'src={} dest={}'.format(
+                shlex.quote(src_path + '/'), shlex.quote(self.dest_path + '/')
+            ),
+            'verbosity': verbosity,
+            'event_handler': self.cb.event_handler,
+            'status_handler': self.cb.status_handler,
+            'envvars': self.envs,
+            **kwargs,
         }
-        """
-        result = {'success': [], 'failed': []}
-        for host in self.results_callback.result_q['contacted']:
-            result['success'].append(host)
-
-        for host, msgs in self.results_callback.result_q['dark'].items():
-            msg = '\n'.join(['{} {}: {}'.format(
-                msg.get('module_stdout', ''),
-                msg.get('invocation', {}).get('module_name'),
-                msg.get('msg', '')) for msg in msgs])
-            result['failed'].append((host, msg))
-        return result
-
-
-def test_run():
-    assets = [
-        {
-                "hostname": "192.168.244.129",
-                "ip": "192.168.244.129",
-                "port": 22,
-                "username": "root",
-                "password": "redhat",
-        },
-    ]
-    task_tuple = (('shell', 'ls'),)
-    hoc = AdHocRunner(hosts=assets)
-    hoc.results_callback = CommandResultCallback()
-    ret = hoc.run(task_tuple)
-    print(ret)
-
-    #play = PlayBookRunner(assets, playbook_path='/tmp/some.yml')
-    """
-    # /tmp/some.yml
-    ---
-    - name: Test the plabybook API.
-      hosts: all
-      remote_user: root
-      gather_facts: yes
-      tasks:
-       - name: exec uptime
-         shell: uptime
-    """
-    #play.run()
-
-
-if __name__ == "__main__":
-    test_run()
+        interface.run(**run_kwargs)
+        try:
+            shutil.rmtree(self.share_src_dir)
+        except OSError as e:
+            print(f"del upload tmp dir {self.share_src_dir} failed! {e}")
+        return self.cb

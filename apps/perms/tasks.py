@@ -1,48 +1,146 @@
 # ~*~ coding: utf-8 ~*~
 from __future__ import absolute_import, unicode_literals
 
+from collections import defaultdict
+from datetime import timedelta
+
 from celery import shared_task
-from common.utils import get_logger, encrypt_password
-from ops.utils import run_AdHoc
+from django.conf import settings
+from django.db.transaction import atomic
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+
+from common.const.crontab import CRONTAB_AT_AM_TEN
+from common.utils import get_logger
+from common.utils.timezone import dt_parser, local_now
+from ops.celery.decorator import register_as_period_task
+from orgs.utils import tmp_to_root_org
+from perms.models import AssetPermission
+from perms.notifications import (
+    PermedAssetsWillExpireUserMsg,
+    AssetPermsWillExpireForOrgAdminMsg,
+    AssetPermissionWillExpireSoonUserMsg,
+)
 
 logger = get_logger(__file__)
+EXPIRE_SOON_NOTICE_BATCH_SIZE = 200
 
 
-@shared_task(bind=True)
-def push_users(self, assets, users):
-    """
-    user: {
-        name: 'web',
-        username: 'web',
-        shell: '/bin/bash',
-        password: '123123123',
-        public_key: 'string',
-        sudo: '/bin/whoami,/sbin/ifconfig'
-    }
-    """
-    if isinstance(users, dict):
-        users = [users]
-    if isinstance(assets, dict):
-        assets = [assets]
-    task_tuple = []
+@shared_task(
+    verbose_name=_('Send asset permission expired notification'),
+    description=_(
+        """Check every day at 10 a.m. and send a notification message to users associated with 
+        assets whose authorization is about to expire, as well as to the organization's 
+        administrators in advance, to remind them that the asset authorization
+        will expire in a few days"""
+    )
+)
+@register_as_period_task(crontab=CRONTAB_AT_AM_TEN)
+@atomic()
+@tmp_to_root_org()
+def check_asset_permission_will_expired():
+    first_notice_days = settings.PERM_EXPIRED_FIRST_NOTICE_DAYS
+    daily_notice_days = settings.PERM_EXPIRED_DAILY_NOTICE_DAYS
+    start = local_now()
+    end = start + timedelta(days=first_notice_days + 1)
 
-    for user in users:
-        # 添加用户, 设置公钥, 设置sudo
-        task_tuple.extend([
-            ('user', 'name={} shell={} state=present password={}'.format(
-                user['username'], user.get('shell', '/bin/bash'),
-                encrypt_password(user.get('password', None)))),
-            ('authorized_key', "user={} state=present key='{}'".format(
-                user['username'], user['public_key'])),
-            ('lineinfile',
-             "dest=/etc/sudoers state=present regexp='^{0} ALL=' "
-             "line='{0} ALL=(ALL) NOPASSWD: {1}' "
-             "validate='visudo -cf %s'".format(
-                 user['username'], user.get('sudo', '/sbin/ifconfig')
-             ))
-        ])
-    task_name = 'Push user {}'.format(','.join([user['name'] for user in users]))
-    task = run_AdHoc(task_tuple, assets, pattern='all',
-                     task_name=task_name, task_id=self.request.id)
-    return task
+    user_asset_remain_day_mapper = defaultdict(dict)
+    user_permission_remain_day_mapper = defaultdict(lambda: defaultdict(set))
+    org_perm_remain_day_mapper = defaultdict(dict)
 
+    asset_perms = AssetPermission.objects.filter(
+        is_active=True,
+        date_expired__gte=start,
+        date_expired__lte=end,
+    ).distinct()
+
+    for asset_perm in asset_perms:
+        date_expired = dt_parser(asset_perm.date_expired)
+        date_expired = timezone.localtime(date_expired).date()
+        remain_days = (date_expired - start.date()).days
+        should_notify = (
+            remain_days == first_notice_days
+            or 0 <= remain_days <= daily_notice_days
+        )
+        if not should_notify:
+            continue
+
+        org = asset_perm.org
+        # 资产授权按照组织分类
+        if org in org_perm_remain_day_mapper[remain_days]:
+            org_perm_remain_day_mapper[remain_days][org].add(asset_perm)
+        else:
+            org_perm_remain_day_mapper[remain_days][org] = {asset_perm, }
+
+        # 计算每个用户即将过期的资产
+        users = asset_perm.get_all_users()
+        assets = asset_perm.get_all_assets()
+
+        for u in users:
+            user_permission_remain_day_mapper[remain_days][u].add(asset_perm)
+            if u in user_asset_remain_day_mapper[remain_days]:
+                user_asset_remain_day_mapper[remain_days][u].update(assets)
+            else:
+                user_asset_remain_day_mapper[remain_days][u] = set(assets)
+
+    for day_count, user_asset_mapper in user_asset_remain_day_mapper.items():
+        for user, assets in user_asset_mapper.items():
+            PermedAssetsWillExpireUserMsg(
+                user, assets, day_count, permissions=user_permission_remain_day_mapper[day_count][user],
+            ).publish_async()
+
+    for day_count, org_perm_mapper in org_perm_remain_day_mapper.items():
+        for org, perms in org_perm_mapper.items():
+            org_admins = org.admins.all()
+            for org_admin in org_admins:
+                AssetPermsWillExpireForOrgAdminMsg(org_admin, perms, org, day_count).publish_async()
+
+
+def _claim_one_expire_soon_notice(now):
+    with atomic():
+        asset_perm = AssetPermission.objects.select_for_update(skip_locked=True).filter(
+            is_active=True,
+            expire_soon_notice_at__isnull=False,
+            expire_soon_notice_at__lte=now,
+            expire_soon_notice_sent_at__isnull=True,
+            date_expired__gt=now,
+        ).order_by('expire_soon_notice_at').first()
+        if asset_perm is None:
+            return None
+
+        claimed_at = timezone.now()
+        asset_perm.expire_soon_notice_sent_at = claimed_at
+        asset_perm.save(update_fields=['expire_soon_notice_sent_at'])
+        return asset_perm
+
+
+def _publish_one_expire_soon_notice(now):
+    asset_perm = _claim_one_expire_soon_notice(now)
+    if asset_perm is None:
+        return False
+
+    for user in asset_perm.get_all_users():
+        try:
+            AssetPermissionWillExpireSoonUserMsg(user, asset_perm).publish_async()
+        except Exception:
+            logger.exception(
+                'Enqueue asset permission expiration-soon notice failed: '
+                'permission=%s, user=%s',
+                asset_perm.id, user.id,
+            )
+    return True
+
+
+@shared_task(
+    verbose_name=_('Send asset permission expiration-soon notification'),
+    description=_(
+        'Check due asset permission expiration-soon notices every minute and enqueue notifications'
+    )
+)
+@register_as_period_task(interval=60)
+@tmp_to_root_org()
+def check_asset_permission_will_expire_soon():
+    now = timezone.now()
+    for _ in range(EXPIRE_SOON_NOTICE_BATCH_SIZE):
+        if not _publish_one_expire_soon_notice(now):
+            break

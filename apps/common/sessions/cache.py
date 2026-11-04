@@ -1,0 +1,64 @@
+from importlib import import_module
+
+from django.conf import settings
+from django.contrib.sessions.backends.cache import (
+    SessionStore as DjangoSessionStore
+)
+from django.core.cache import cache, caches
+
+from . import SessionSaveMixin
+
+
+class SessionStore(SessionSaveMixin, DjangoSessionStore):
+    pass
+
+
+class RedisUserSessionManager:
+    JMS_SESSION_KEY = 'jms_session_key'
+
+    def __init__(self):
+        self.client = cache.client.get_client()
+
+    def add_or_increment(self, session_key):
+        self.client.hincrby(self.JMS_SESSION_KEY, session_key, 1)
+
+    def decrement(self, session_key):
+        self.client.hincrby(self.JMS_SESSION_KEY, session_key, -1)
+
+    def remove(self, session_key):
+        try:
+            self.client.hdel(self.JMS_SESSION_KEY, session_key)
+            session_store = import_module(settings.SESSION_ENGINE).SessionStore(session_key)
+            session_store.delete()
+        except Exception:
+            pass
+
+    def check_active(self, session_key):
+        count = self.client.hget(self.JMS_SESSION_KEY, session_key)
+        count = 0 if count is None else int(count.decode('utf-8'))
+        return count > 0
+
+    def get_active_keys(self):
+        session_keys = []
+        for k, v in self.client.hgetall(self.JMS_SESSION_KEY).items():
+            count = int(v.decode('utf-8'))
+            if count <= 0:
+                continue
+            key = k.decode('utf-8')
+            session_keys.append(key)
+        return session_keys
+
+    @staticmethod
+    def get_keys():
+        session_store_cls = import_module(settings.SESSION_ENGINE).SessionStore
+        if hasattr(session_store_cls, 'get_model_class'):
+            from django.utils import timezone
+            return list(session_store_cls.get_model_class().objects.filter(
+                expire_date__gt=timezone.now(),
+            ).values_list('session_key', flat=True))
+        cache_key_prefix = session_store_cls.cache_key_prefix
+        keys = caches[settings.SESSION_CACHE_ALIAS].iter_keys('*')
+        return [k.replace(cache_key_prefix, '') for k in keys]
+
+
+user_session_manager = RedisUserSessionManager()

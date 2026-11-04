@@ -1,0 +1,55 @@
+from django.db import models, transaction
+from django.utils.translation import gettext_lazy as _
+from django.utils import timezone
+
+from common.utils import get_request_ip, get_ip_city
+from common.utils.timezone import local_now_display
+from .base import UserBaseACL
+
+
+class LoginACL(UserBaseACL):
+    workflow = models.ForeignKey(
+        'tickets.Workflow', null=True, blank=True, on_delete=models.PROTECT,
+        related_name='+', verbose_name=_('Workflow'),
+    )
+    # 规则, ip_group, time_period
+    rules = models.JSONField(default=dict, verbose_name=_('Rule'))
+
+    class Meta(UserBaseACL.Meta):
+        verbose_name = _('Login acl')
+        abstract = False
+
+    def __str__(self):
+        return self.name
+
+    def is_action(self, action):
+        return self.action == action
+
+    def is_user_in_reviewers(self, user):
+        return self.reviewers.filter(id=user.id).exists()
+    
+    @transaction.atomic
+    def create_confirm_ticket(self, request, user):
+        from tickets import const
+        from tickets.models import Ticket
+        from orgs.models import Organization
+        title = _('Login confirm') + ' {}'.format(user)
+        login_ip = get_request_ip(request) if request else ''
+        login_ip = login_ip or '0.0.0.0'
+        login_city = get_ip_city(login_ip)
+        login_datetime = timezone.now()
+        data = {
+            'title': title,
+            'applicant': user,
+            'org_id': Organization.ROOT_ID,
+            'type': const.TicketType.login_confirm,
+            'request_data': {
+                'apply_login_ip': login_ip,
+                'apply_login_city': str(login_city),
+                'apply_login_datetime': login_datetime.isoformat(),
+            },
+        }
+        ticket = Ticket.objects.create(**data)
+        assignees = self.reviewers.all()
+        ticket.open_by_system(assignees, workflow=self.workflow)
+        return ticket
